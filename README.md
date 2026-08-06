@@ -1,3 +1,8 @@
+# UPDATE: 2026-08-06 J Newland
+This is a fork of the original project with a data logging added to the code.
+https://makecode.microbit.org/S90276-89351-12780-36321
+
+# Everthing below is original content.
 # Micro:bit & vital signs 
 ## *( Project powered by Liki: www.likims.com )*
 
