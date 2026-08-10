@@ -1,8 +1,21 @@
 # UPDATE: 2026-08-06 J Newland
 This is a fork of the original project with a data logging added to the code.
-https://makecode.microbit.org/S90276-89351-12780-36321
+[https://makecode.microbit.org/S90276-89351-12780-36321](https://makecode.microbit.org/S90276-89351-12780-36321)
+
+The OpenCV-powered JavaScript with a draggable measurement box:
+[https://github.com/jimmynewland/homelab_datalogger/blob/master/opencv_js_remote_ppg.html](https://github.com/jimmynewland/homelab_datalogger/blob/master/opencv_js_remote_ppg.html)
+(live version as of 2026-08-10: [https://thinkingwithcode.com/ppg/](https://thinkingwithcode.com/ppg/))
+
+The OpenCV-powered JavaScript with Haar cascade measurement box:
+[https://github.com/jimmynewland/homelab_datalogger/blob/master/opencv_js_remote_ppg_with_haar.html](https://github.com/jimmynewland/homelab_datalogger/blob/master/opencv_js_remote_ppg_with_haar.html)
+(live version as of 2026-08-10: [https://thinkingwithcode.com/ppg/](https://thinkingwithcode.com/ppg/ppg_with_haar.php))
+
 
 # Everthing below is original content.
+
+
+
+
 # Micro:bit & vital signs 
 ## *( Project powered by Liki: www.likims.com )*
 
