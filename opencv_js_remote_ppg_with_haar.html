@@ -1,0 +1,550 @@
+<?php
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Pragma: no-cache");
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Webcam Photoplethysmogram</title>
+
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<style>
+  body {
+    margin: 0;
+    text-align: center;
+    font-family: Arial;
+    background: #fff;
+    color: #111;
+  }
+
+  h2 {
+    font-size: 1.4rem;
+    margin-top: 10px;
+  }
+
+  button {
+    margin: 10px;
+    padding: 14px;
+    font-size: 16px;
+    width: 90%;
+    max-width: 300px;
+    border-radius: 10px;
+  }
+
+  video, canvas {
+    width: 95%;
+    max-width: 640px;
+    height: auto;
+    border: 1px solid #444;
+    margin-top: 10px;
+    border-radius: 8px;
+  }
+
+  #signalCanvas {
+    height: auto;
+  }
+
+  p {
+    font-size: 1rem;
+    padding: 0 10px;
+  }
+</style>
+
+</head>
+
+<body>
+
+<h2>Webcam Photoplethysmogram</h2>
+
+<button id="toggleBtn">Start</button>
+<br>
+
+<video id="video" width="640" height="480"
+       autoplay playsinline style="display:none;"></video>
+<br>
+<canvas id="canvas" width="640" height="480"></canvas><br>
+<canvas id="signalCanvas" width="640" height="200"></canvas>
+
+<p id="output">Press Start</p>
+
+<button id="downloadBtn" disabled>Download CSV</button>
+
+<script>
+let video = document.getElementById("video");
+let canvas = document.getElementById("canvas");
+let output = document.getElementById("output");
+let button = document.getElementById("toggleBtn");
+let downloadBtn = document.getElementById("downloadBtn");
+
+let stream = null;
+let isRunning = false;
+
+let cap, src;
+
+let signalBuffer = [];
+let timeBuffer = [];
+const bufferSize = 300;
+
+// Full-session log kept separate from the rolling display buffer above,
+// so the CSV export covers the entire recording, not just the last window.
+let sessionLog = [];
+let sessionStartTime = null;
+
+// Last valid BPM reading, held on screen between successful detections
+// so the display doesn't flicker back to "Measuring..." every frame.
+let lastBPM = null;
+
+// --- Forehead ROI tracking ---
+// The original fixed 60x60 box was really sized/positioned for a finger
+// pressed against the lens. For remote (camera) PPG off a forehead, the
+// ROI needs to (a) actually sit on the forehead, which moves as the
+// person moves, and (b) be shaped like a forehead — wide and short —
+// rather than a square, to average more skin pixels without picking up
+// eyebrows, hair, or background.
+let faceCascade = null;
+let cascadeReady = false;
+let grayMat = null;   // full-resolution grayscale, reused each frame
+let smallGray = null; // downscaled grayscale used for detection (much faster)
+let faces = null;
+
+// Detection runs on a downscaled copy of the frame — Haar cascades are
+// expensive, and full 640x480 detection every few frames is enough to
+// visibly slow the capture loop down. Rects found here get scaled back
+// up to full-resolution coordinates before use.
+const DETECT_SCALE = 0.5;
+
+// Smoothed ROI in {x,y,w,h} form, eased toward each new detection rather
+// than snapped, so head movement doesn't inject step artifacts into the
+// PPG signal. Null until the first detection (or until fallback kicks in).
+let currentROI = null;
+let frameCounter = 0;
+const DETECT_EVERY_N_FRAMES = 10; // Haar detection is costly; no need every frame
+
+async function loadFaceCascade() {
+  try {
+    // raw.githubusercontent.com serves this with permissive CORS and is
+    // the source most OpenCV.js face-detection samples use; docs.opencv.org
+    // doesn't reliably host the raw XML at a stable path across versions.
+    const cascadeUrl = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml";
+    const response = await fetch(cascadeUrl);
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const buffer = new Uint8Array(await response.arrayBuffer());
+
+    cv.FS_createDataFile("/", "haarcascade_frontalface_default.xml", buffer, true, false, false);
+
+    const classifier = new cv.CascadeClassifier();
+    // load() returns a boolean rather than throwing on failure — if we
+    // don't check it, a bad/incomplete cascade file silently leaves the
+    // classifier unusable, and the first detectMultiScale() call later
+    // throws instead, taking down the whole capture loop with it.
+    const loaded = classifier.load("haarcascade_frontalface_default.xml");
+    if (!loaded) {
+      classifier.delete();
+      throw new Error("CascadeClassifier.load() returned false — file fetched but not a usable cascade");
+    }
+
+    faceCascade = classifier;
+    cascadeReady = true;
+    console.log("Face cascade loaded; forehead tracking active.");
+  } catch (err) {
+    console.warn("Face detection unavailable, using fixed forehead ROI instead:", err);
+    cascadeReady = false;
+    faceCascade = null;
+  }
+}
+
+// Forehead sits in the upper-center portion of a detected face box,
+// between the eyebrows and hairline — narrower than the full face width
+// so we don't sample hair or background at the edges. `face` is in
+// full-resolution coordinates.
+function foreheadRectFromFace(face) {
+  return {
+    x: face.x + face.width * 0.30,
+    y: face.y + face.height * 0.08,
+    w: face.width * 0.40,
+    h: face.height * 0.18
+  };
+}
+
+function updateROI() {
+  frameCounter++;
+
+  let shouldDetect = cascadeReady && (currentROI === null || frameCounter % DETECT_EVERY_N_FRAMES === 0);
+
+  if (shouldDetect) {
+    try {
+      cv.cvtColor(src, grayMat, cv.COLOR_RGBA2GRAY);
+      cv.resize(grayMat, smallGray, new cv.Size(0, 0), DETECT_SCALE, DETECT_SCALE, cv.INTER_LINEAR);
+      cv.equalizeHist(smallGray, smallGray);
+
+      faceCascade.detectMultiScale(
+        smallGray, faces, 1.1, 3, 0,
+        new cv.Size(40, 40), new cv.Size(0, 0) // ~80x80 in full-res terms
+      );
+
+      if (faces.size() > 0) {
+        // Largest detected face = the most prominent one in frame.
+        let best = faces.get(0);
+        for (let i = 1; i < faces.size(); i++) {
+          let f = faces.get(i);
+          if (f.width * f.height > best.width * best.height) best = f;
+        }
+
+        // Scale back up from the downscaled detection frame to the
+        // full-resolution coordinates the ROI is actually sampled in.
+        let fullFace = {
+          x: best.x / DETECT_SCALE,
+          y: best.y / DETECT_SCALE,
+          width: best.width / DETECT_SCALE,
+          height: best.height / DETECT_SCALE
+        };
+
+        let target = foreheadRectFromFace(fullFace);
+
+        if (currentROI === null) {
+          currentROI = target;
+        } else {
+          const alpha = 0.3; // easing factor toward the new detection
+          currentROI = {
+            x: currentROI.x + alpha * (target.x - currentROI.x),
+            y: currentROI.y + alpha * (target.y - currentROI.y),
+            w: currentROI.w + alpha * (target.w - currentROI.w),
+            h: currentROI.h + alpha * (target.h - currentROI.h)
+          };
+        }
+      }
+    } catch (err) {
+      // Detection failing mid-session shouldn't take down the whole
+      // capture loop — disable tracking for the rest of the run and let
+      // the fixed-box fallback below take over instead.
+      console.warn("Face detection failed, disabling tracking for this session:", err);
+      cascadeReady = false;
+    }
+  }
+
+  if (currentROI === null) {
+    // No face detected yet (or detection unavailable): fall back to a
+    // fixed box shaped like a forehead band rather than the old 60x60
+    // square, positioned where a forehead typically lands in frame.
+    currentROI = {
+      x: video.width / 2 - 80,
+      y: video.height / 2 - 140,
+      w: 160,
+      h: 50
+    };
+  }
+
+  return currentROI;
+}
+
+
+async function startCamera() {
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 640, height: 480 },
+    audio: false
+  });
+
+  video.srcObject = stream;
+
+  return new Promise(resolve => {
+    video.onloadedmetadata = () => {
+      video.play();
+      resolve();
+    };
+  });
+}
+
+function stopCamera() {
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+}
+
+// OPENCV READY
+function waitForOpenCV() {
+  return new Promise(resolve => {
+    if (window.cv && cv.Mat) resolve();
+    else {
+      window.cv = window.cv || {};
+      cv.onRuntimeInitialized = resolve;
+    }
+  });
+}
+
+function detrend(signal) {
+  let mean = signal.reduce((a,b)=>a+b,0)/signal.length;
+  return signal.map(v=>v-mean);
+}
+
+function smooth(signal, window=4) {
+  let result=[];
+  for(let i=0;i<signal.length;i++){
+    let sum=0,count=0;
+    for(let j=i-window;j<=i+window;j++){
+      if(j>=0 && j<signal.length){ sum+=signal[j]; count++; }
+    }
+    result.push(sum/count);
+  }
+  return result;
+}
+
+function drawSignal(signal) {
+  let canvasSig = document.getElementById("signalCanvas");
+  let ctx = canvasSig.getContext("2d");
+
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0,0,canvasSig.width,canvasSig.height);
+
+  if(signal.length < 2) return;
+
+  let min = Math.min(...signal);
+  let max = Math.max(...signal);
+  let range = max - min || 1;
+
+  ctx.beginPath();
+
+  for (let i = 0; i < signal.length; i++) {
+    let x = (i / bufferSize) * canvasSig.width;
+    let y = canvasSig.height - ((signal[i]-min)/range)*canvasSig.height;
+
+    if(i===0) ctx.moveTo(x,y);
+    else ctx.lineTo(x,y);
+  }
+
+  ctx.strokeStyle = "#00ffcc";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+// Remote PPG off a forehead has much lower SNR than a fingertip signal:
+// motion, ambient light flicker, and the dicrotic notch in each real pulse
+// all create extra local maxima that a naive peak counter mistakes for
+// separate heartbeats. Instead of counting peaks, estimate HR from the
+// dominant frequency in the physiologically plausible band (42-180 BPM =
+// 0.7-3.0 Hz). This is the standard approach in camera-based rPPG (e.g.
+// CHROM/POS-style pipelines) and is inherently robust to noisy peak shapes,
+// since it never looks at individual peaks at all.
+function estimateHR(signal, time) {
+  // Need enough samples, and enough elapsed time, for usable frequency
+  // resolution. Frequency resolution ~= 1 / (window duration in seconds).
+  if (signal.length < 100) return null;
+
+  let duration = time[time.length - 1] - time[0];
+  if (duration < 4) return null;
+
+  let detrended = detrend(signal);
+
+  const minHz = 0.7;   // 42 BPM
+  const maxHz = 3.0;   // 180 BPM
+  const stepHz = 0.02; // ~1.2 BPM resolution
+
+  let bestFreq = null;
+  let bestMag = -Infinity;
+
+  // Goertzel-style DFT magnitude at each candidate frequency, evaluated
+  // directly against the actual sample timestamps (frame timing from
+  // requestAnimationFrame/getUserMedia isn't perfectly uniform).
+  for (let f = minHz; f <= maxHz; f += stepHz) {
+    let re = 0, im = 0;
+    for (let n = 0; n < detrended.length; n++) {
+      let angle = 2 * Math.PI * f * time[n];
+      re += detrended[n] * Math.cos(angle);
+      im -= detrended[n] * Math.sin(angle);
+    }
+    let mag = re * re + im * im;
+    if (mag > bestMag) {
+      bestMag = mag;
+      bestFreq = f;
+    }
+  }
+
+  if (bestFreq === null) return null;
+
+  return Math.round(bestFreq * 60);
+}
+
+function processFrame() {
+  if (!isRunning) return;
+
+  try {
+    cap.read(src);
+
+    let roiRect = updateROI();
+    let x = Math.round(roiRect.x);
+    let y = Math.round(roiRect.y);
+    let w = Math.round(roiRect.w);
+    let h = Math.round(roiRect.h);
+
+    // Clamp to frame bounds — easing/detection can occasionally push the
+    // box slightly outside the image, which cv.Rect / src.roi will reject.
+    x = Math.max(0, Math.min(x, video.width - 1));
+    y = Math.max(0, Math.min(y, video.height - 1));
+    w = Math.max(1, Math.min(w, video.width - x));
+    h = Math.max(1, Math.min(h, video.height - y));
+
+    let roi = src.roi(new cv.Rect(x,y,w,h));
+    let mean = cv.mean(roi);
+    let green = mean[1];
+
+    let t = performance.now()/1000;
+
+    signalBuffer.push(green);
+    timeBuffer.push(t);
+
+    if(signalBuffer.length > bufferSize){
+      signalBuffer.shift();
+      timeBuffer.shift();
+    }
+
+    let processed = smooth(detrend(signalBuffer),4);
+
+    drawSignal(processed);
+
+    let bpm = estimateHR(signalBuffer,timeBuffer);
+    if (bpm !== null) {
+      lastBPM = bpm;
+    }
+
+    // Log this sample for CSV export. Use the smoothed value at the
+    // corresponding position in the rolling buffer (last entry = current frame).
+    if (sessionStartTime === null) sessionStartTime = t;
+    sessionLog.push({
+      elapsed: t - sessionStartTime,
+      raw: green,
+      smoothed: processed[processed.length - 1]
+    });
+
+    cv.rectangle(
+      src,
+      new cv.Point(x,y),
+      new cv.Point(x+w,y+h),
+      [255,0,0,255],2
+    );
+
+    let label = lastBPM !== null
+      ? lastBPM + " BPM"
+      : "Measuring...";
+
+    // Draw the heart rate directly on the video feed via the OpenCV.js API.
+    cv.putText(
+      src,
+      label,
+      new cv.Point(10, 30),
+      cv.FONT_HERSHEY_SIMPLEX,
+      1,
+      [255, 0, 0, 255],
+      2
+    );
+
+    output.textContent = label;
+
+    cv.imshow("canvas",src);
+
+    roi.delete();
+  } catch (err) {
+    // A single bad frame (or a detection hiccup) should never silently
+    // kill the whole capture loop the way an uncaught throw inside a
+    // requestAnimationFrame callback would. Log it and keep going.
+    console.error("processFrame error (continuing):", err);
+  }
+
+  requestAnimationFrame(processFrame);
+}
+
+async function startApp() {
+  try{
+    await startCamera();
+    await waitForOpenCV();
+
+    cap = new cv.VideoCapture(video);
+    src = new cv.Mat(video.height, video.width, cv.CV_8UC4);
+    grayMat = new cv.Mat();
+    smallGray = new cv.Mat();
+    faces = new cv.RectVector();
+
+    if (!faceCascade) {
+      await loadFaceCascade(); // safe to no-op on repeat starts once loaded
+    }
+
+    currentROI = null;
+    frameCounter = 0;
+
+    signalBuffer=[];
+    timeBuffer=[];
+    sessionLog=[];
+    sessionStartTime=null;
+    lastBPM=null;
+    downloadBtn.disabled = true;
+
+    isRunning=true;
+    processFrame();
+  }catch(err){
+    console.error(err);
+    output.textContent="Error starting camera";
+  }
+}
+
+function downloadCSV(){
+  if(sessionLog.length === 0){
+    alert("No data recorded yet. Start and stop a capture first.");
+    return;
+  }
+
+  let rows = ["elapsed_seconds,raw_green,smoothed_green"];
+  for(const entry of sessionLog){
+    rows.push(`${entry.elapsed.toFixed(4)},${entry.raw.toFixed(6)},${entry.smoothed.toFixed(6)}`);
+  }
+  let csvContent = rows.join("\n");
+
+  let blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  let url = URL.createObjectURL(blob);
+
+  let a = document.createElement("a");
+  let timestamp = new Date().toISOString().replace(/[:.]/g,"-");
+  a.href = url;
+  a.download = `ppg_signal_${timestamp}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function stopApp(){
+  isRunning=false;
+  stopCamera();
+
+  let ctx = canvas.getContext("2d");
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  let sigCtx = document.getElementById("signalCanvas").getContext("2d");
+  sigCtx.clearRect(0,0,640,200);
+
+  if(src) src.delete();
+  if(grayMat) { grayMat.delete(); grayMat = null; }
+  if(smallGray) { smallGray.delete(); smallGray = null; }
+  if(faces) { faces.delete(); faces = null; }
+
+  output.textContent="Stopped";
+  downloadBtn.disabled = sessionLog.length === 0;
+}
+
+button.onclick = async () => {
+  if(!isRunning){
+    button.textContent="Stop";
+    await startApp();
+  }else{
+    button.textContent="Start";
+    stopApp();
+  }
+};
+
+downloadBtn.onclick = downloadCSV;
+</script>
+
+</body>
+</html>

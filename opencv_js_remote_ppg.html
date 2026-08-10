@@ -1,0 +1,475 @@
+<?php
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Pragma: no-cache");
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Using AI and your Webcam for Photoplethysmogramy</title>
+
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<style>
+  body {
+    margin: 0;
+    text-align: center;
+    font-family: Arial;
+    background: #fff;
+    color: #111;
+  }
+
+  h2 {
+    font-size: 1.4rem;
+    margin-top: 10px;
+  }
+
+  button {
+    margin: 10px;
+    padding: 14px;
+    font-size: 16px;
+    width: 90%;
+    max-width: 300px;
+    border-radius: 10px;
+  }
+
+  video, canvas {
+    width: 95%;
+    max-width: 640px;
+    height: auto;
+    border: 1px solid #444;
+    margin-top: 10px;
+    border-radius: 8px;
+  }
+
+  #signalCanvas {
+    height: auto;
+  }
+
+  p {
+    font-size: 1rem;
+    padding: 0 10px;
+  }
+</style>
+
+</head>
+
+<body>
+
+<h2>Using AI and your Webcam for Photoplethysmogramy</h2>
+
+<button id="toggleBtn">Start</button>
+<br>
+
+<video id="video" width="640" height="480"
+       autoplay playsinline style="display:none;"></video>
+<br>
+<canvas id="canvas" width="640" height="480"></canvas><br>
+<canvas id="signalCanvas" width="640" height="200"></canvas>
+
+<p id="output">Press Start</p>
+
+<button id="downloadBtn" disabled>Download CSV</button>
+
+<script>
+let video = document.getElementById("video");
+let canvas = document.getElementById("canvas");
+let output = document.getElementById("output");
+let button = document.getElementById("toggleBtn");
+let downloadBtn = document.getElementById("downloadBtn");
+
+let stream = null;
+let isRunning = false;
+
+let cap, src;
+
+let signalBuffer = [];
+let timeBuffer = [];
+const bufferSize = 300;
+
+// Full-session log kept separate from the rolling display buffer above,
+// so the CSV export covers the entire recording, not just the last window.
+let sessionLog = [];
+let sessionStartTime = null;
+
+// Last valid BPM reading, held on screen between successful detections
+// so the display doesn't flicker back to "Measuring..." every frame.
+let lastBPM = null;
+
+// Fixed-size forehead ROI: wider than it is tall, since a forehead is a
+// wide, short band of skin rather than a square. Size stays fixed; the
+// position (top-left corner) is mutable so it can be dragged with the
+// mouse to line up with wherever the person's forehead actually is.
+const foreheadROI = { w: 100, h: 50 };
+let roiX = video.width / 2 - foreheadROI.w / 2;
+let roiY = video.height / 2 - 140;
+
+let isDraggingROI = false;
+let dragOffsetX = 0, dragOffsetY = 0;
+
+// Convert a mouse/touch client position into the canvas's own pixel
+// coordinate space (640x480), accounting for CSS scaling of the element.
+function toCanvasCoords(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return {
+    x: (clientX - rect.left) * scaleX,
+    y: (clientY - rect.top) * scaleY
+  };
+}
+
+function isInsideROI(px, py) {
+  return px >= roiX && px <= roiX + foreheadROI.w &&
+         py >= roiY && py <= roiY + foreheadROI.h;
+}
+
+function startDrag(clientX, clientY) {
+  const pt = toCanvasCoords(clientX, clientY);
+  if (isInsideROI(pt.x, pt.y)) {
+    isDraggingROI = true;
+    dragOffsetX = pt.x - roiX;
+    dragOffsetY = pt.y - roiY;
+  }
+}
+
+// Let's the user move the ROI for ease of use
+function moveDrag(clientX, clientY) {
+  if (!isDraggingROI) return;
+  const pt = toCanvasCoords(clientX, clientY);
+
+  let newX = pt.x - dragOffsetX;
+  let newY = pt.y - dragOffsetY;
+
+  // Keep the box fully inside the frame.
+  newX = Math.max(0, Math.min(newX, video.width - foreheadROI.w));
+  newY = Math.max(0, Math.min(newY, video.height - foreheadROI.h));
+
+  roiX = newX;
+  roiY = newY;
+}
+
+function endDrag() {
+  isDraggingROI = false;
+}
+
+canvas.style.cursor = "grab";
+canvas.addEventListener("mousedown", e => {
+  startDrag(e.clientX, e.clientY);
+  if (isDraggingROI) canvas.style.cursor = "grabbing";
+});
+window.addEventListener("mousemove", e => moveDrag(e.clientX, e.clientY));
+window.addEventListener("mouseup", () => {
+  endDrag();
+  canvas.style.cursor = "grab";
+});
+
+canvas.addEventListener("touchstart", e => {
+  const t = e.touches[0];
+  startDrag(t.clientX, t.clientY);
+  if (isDraggingROI) e.preventDefault(); // stop page scroll while dragging
+}, { passive: false });
+canvas.addEventListener("touchmove", e => {
+  if (isDraggingROI) {
+    const t = e.touches[0];
+    moveDrag(t.clientX, t.clientY);
+    e.preventDefault();
+  }
+}, { passive: false });
+canvas.addEventListener("touchend", endDrag);
+
+
+async function startCamera() {
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 640, height: 480 },
+    audio: false
+  });
+
+  video.srcObject = stream;
+
+  return new Promise(resolve => {
+    video.onloadedmetadata = () => {
+      video.play();
+      resolve();
+    };
+  });
+}
+
+function stopCamera() {
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+}
+
+// OPENCV READY
+function waitForOpenCV() {
+  return new Promise(resolve => {
+    if (window.cv && cv.Mat) resolve();
+    else {
+      window.cv = window.cv || {};
+      cv.onRuntimeInitialized = resolve;
+    }
+  });
+}
+
+function detrend(signal) {
+  let mean = signal.reduce((a,b)=>a+b,0)/signal.length;
+  return signal.map(v=>v-mean);
+}
+
+function smooth(signal, window=4) {
+  let result=[];
+  for(let i=0;i<signal.length;i++){
+    let sum=0,count=0;
+    for(let j=i-window;j<=i+window;j++){
+      if(j>=0 && j<signal.length){ sum+=signal[j]; count++; }
+    }
+    result.push(sum/count);
+  }
+  return result;
+}
+
+function drawSignal(signal) {
+  let canvasSig = document.getElementById("signalCanvas");
+  let ctx = canvasSig.getContext("2d");
+
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0,0,canvasSig.width,canvasSig.height);
+
+  if(signal.length < 2) return;
+
+  let min = Math.min(...signal);
+  let max = Math.max(...signal);
+  let range = max - min || 1;
+
+  ctx.beginPath();
+
+  for (let i = 0; i < signal.length; i++) {
+    let x = (i / bufferSize) * canvasSig.width;
+    let y = canvasSig.height - ((signal[i]-min)/range)*canvasSig.height;
+
+    if(i===0) ctx.moveTo(x,y);
+    else ctx.lineTo(x,y);
+  }
+
+  ctx.strokeStyle = "#00ffcc";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+// Remote PPG off a forehead has much lower SNR than a fingertip signal:
+// motion, ambient light flicker, and the dicrotic notch in each real pulse
+// all create extra local maxima that a naive peak counter mistakes for
+// separate heartbeats. Instead of counting peaks, estimate HR from the
+// dominant frequency in the physiologically plausible band (42-180 BPM =
+// 0.7-3.0 Hz). This is the standard approach in camera-based rPPG (e.g.
+// CHROM/POS-style pipelines) and is inherently robust to noisy peak shapes,
+// since it never looks at individual peaks at all.
+function estimateHR(signal, time) {
+  // Need enough samples, and enough elapsed time, for usable frequency
+  // resolution. Frequency resolution ~= 1 / (window duration in seconds).
+  if (signal.length < 100) return null;
+
+  let duration = time[time.length - 1] - time[0];
+  if (duration < 4) return null;
+
+  let detrended = detrend(signal);
+
+  const minHz = 0.7;   // 42 BPM
+  const maxHz = 3.0;   // 180 BPM
+  const stepHz = 0.02; // ~1.2 BPM resolution
+
+  let bestFreq = null;
+  let bestMag = -Infinity;
+
+  // Goertzel-style DFT magnitude at each candidate frequency, evaluated
+  // directly against the actual sample timestamps (frame timing from
+  // requestAnimationFrame/getUserMedia isn't perfectly uniform).
+  for (let f = minHz; f <= maxHz; f += stepHz) {
+    let re = 0, im = 0;
+    for (let n = 0; n < detrended.length; n++) {
+      let angle = 2 * Math.PI * f * time[n];
+      re += detrended[n] * Math.cos(angle);
+      im -= detrended[n] * Math.sin(angle);
+    }
+    let mag = re * re + im * im;
+    if (mag > bestMag) {
+      bestMag = mag;
+      bestFreq = f;
+    }
+  }
+
+  if (bestFreq === null) return null;
+
+  return Math.round(bestFreq * 60);
+}
+
+function processFrame() {
+  if (!isRunning) return;
+
+  try {
+    cap.read(src);
+
+    let x = Math.round(roiX);
+    let y = Math.round(roiY);
+    let w = foreheadROI.w;
+    let h = foreheadROI.h;
+
+    // Clamp to frame bounds, just in case.
+    x = Math.max(0, Math.min(x, video.width - 1));
+    y = Math.max(0, Math.min(y, video.height - 1));
+    w = Math.max(1, Math.min(w, video.width - x));
+    h = Math.max(1, Math.min(h, video.height - y));
+
+    let roi = src.roi(new cv.Rect(x,y,w,h));
+    let mean = cv.mean(roi);
+    let green = mean[1];
+
+    let t = performance.now()/1000;
+
+    signalBuffer.push(green);
+    timeBuffer.push(t);
+
+    if(signalBuffer.length > bufferSize){
+      signalBuffer.shift();
+      timeBuffer.shift();
+    }
+
+    let processed = smooth(detrend(signalBuffer),4);
+
+    drawSignal(processed);
+
+    let bpm = estimateHR(signalBuffer,timeBuffer);
+    if (bpm !== null) {
+      lastBPM = bpm;
+    }
+
+    // Log this sample for CSV export. Use the smoothed value at the
+    // corresponding position in the rolling buffer (last entry = current frame).
+    if (sessionStartTime === null) sessionStartTime = t;
+    sessionLog.push({
+      elapsed: t - sessionStartTime,
+      raw: green,
+      smoothed: processed[processed.length - 1]
+    });
+
+    cv.rectangle(
+      src,
+      new cv.Point(x,y),
+      new cv.Point(x+w,y+h),
+      isDraggingROI ? [0,255,255,255] : [255,0,0,255],
+      2
+    );
+
+    let label = lastBPM !== null
+      ? lastBPM + " BPM"
+      : "Measuring...";
+
+    // Draw the heart rate directly on the video feed via the OpenCV.js API.
+    cv.putText(
+      src,
+      label,
+      new cv.Point(10, 30),
+      cv.FONT_HERSHEY_SIMPLEX,
+      1,
+      [255, 0, 0, 255],
+      2
+    );
+
+    output.textContent = label;
+
+    cv.imshow("canvas",src);
+
+    roi.delete();
+  } catch (err) {
+    // A single bad frame (or a detection hiccup) should never silently
+    // kill the whole capture loop the way an uncaught throw inside a
+    // requestAnimationFrame callback would. Log it and keep going.
+    console.error("processFrame error (continuing):", err);
+  }
+
+  requestAnimationFrame(processFrame);
+}
+
+async function startApp() {
+  try{
+    await startCamera();
+    await waitForOpenCV();
+
+    cap = new cv.VideoCapture(video);
+    src = new cv.Mat(video.height, video.width, cv.CV_8UC4);
+
+    signalBuffer=[];
+    timeBuffer=[];
+    sessionLog=[];
+    sessionStartTime=null;
+    lastBPM=null;
+    downloadBtn.disabled = true;
+
+    isRunning=true;
+    processFrame();
+  }catch(err){
+    console.error(err);
+    output.textContent="Error starting camera";
+  }
+}
+
+function downloadCSV(){
+  if(sessionLog.length === 0){
+    alert("No data recorded yet. Start and stop a capture first.");
+    return;
+  }
+
+  let rows = ["t (ms),raw_green,signal"];
+  for(const entry of sessionLog){
+    rows.push(`${(entry.elapsed*1000).toFixed(1)},${entry.raw.toFixed(6)},${entry.smoothed.toFixed(6)}`);
+  }
+  let csvContent = rows.join("\n");
+
+  let blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  let url = URL.createObjectURL(blob);
+
+  let a = document.createElement("a");
+  let timestamp = new Date().toISOString().replace(/[:.]/g,"-");
+  a.href = url;
+  a.download = `ppg_signal_${timestamp}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function stopApp(){
+  isRunning=false;
+  stopCamera();
+
+  let ctx = canvas.getContext("2d");
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  let sigCtx = document.getElementById("signalCanvas").getContext("2d");
+  sigCtx.clearRect(0,0,640,200);
+
+  if(src) src.delete();
+
+  output.textContent="Stopped";
+  downloadBtn.disabled = sessionLog.length === 0;
+}
+
+button.onclick = async () => {
+  if(!isRunning){
+    button.textContent="Stop";
+    await startApp();
+  }else{
+    button.textContent="Start";
+    stopApp();
+  }
+};
+
+downloadBtn.onclick = downloadCSV;
+</script>
+
+</body>
+</html>
