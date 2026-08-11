@@ -10,11 +10,18 @@ The OpenCV-powered JavaScript with Haar cascade measurement box:
 [https://github.com/jimmynewland/homelab_datalogger/blob/master/opencv_js_remote_ppg_with_haar.html](https://github.com/jimmynewland/homelab_datalogger/blob/master/opencv_js_remote_ppg_with_haar.html)
 (live version as of 2026-08-10: [https://thinkingwithcode.com/ppg/](https://thinkingwithcode.com/ppg/ppg_with_haar.php))
 
+Sanple data file from Pulse Sensor: [https://github.com/jimmynewland/homelab_datalogger/blob/master/sample_pulse_signal_pulse_sensor_amped.csv
+](https://github.com/jimmynewland/homelab_datalogger/blob/master/sample_pulse_signal_pulse_sensor_amped.csv
+)
 
+Sample data file from remote PPG App: [https://github.com/jimmynewland/homelab_datalogger/blob/master/sample_pulse_signal_remote_ppg_app.csv](https://github.com/jimmynewland/homelab_datalogger/blob/master/sample_pulse_signal_remote_ppg_app.csv)
+
+
+
+
+
+<br><br><br><br><br><br><br><br>
 # Everthing below is original content.
-
-
-
 
 # Micro:bit & vital signs 
 ## *( Project powered by Liki: www.likims.com )*
