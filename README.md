@@ -1,6 +1,6 @@
 # UPDATE: 2026-08-11 J. Newland
 This is a fork of the original project with a data logging added to the code.
-[https://makecode.microbit.org/S90276-89351-12780-36321](https://makecode.microbit.org/S90276-89351-12780-36321)
+[https://makecode.microbit.org/S98671-06598-91300-90289](https://makecode.microbit.org/S98671-06598-91300-90289)
 
 The OpenCV-powered JavaScript with a draggable measurement box:
 [https://github.com/jimmynewland/homelab_datalogger/blob/master/opencv_js_remote_ppg.html](https://github.com/jimmynewland/homelab_datalogger/blob/master/opencv_js_remote_ppg.html)
